@@ -1,0 +1,35 @@
+name: Verify the latest release as a stranger
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the archive and its receipt, with no token
+        run: |
+          tag=$(curl -sSf https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name)
+          for f in widget.tar.gz widget.tar.gz.receipt; do
+            curl -sSfL -o "$f" "https://github.com/${{ github.repository }}/releases/download/$tag/$f"
+          done
+          ls -l widget.tar.gz widget.tar.gz.receipt
+
+      - name: Build the verifier from the public source, with no token
+        run: |
+          git clone --depth 1 --branch v0 https://github.com/Fountech-ai-Limited/timewitness.git verifier-src
+          git -C verifier-src rev-parse HEAD
+          cargo build --release --manifest-path verifier-src/Cargo.toml --bin timewitness
+
+      - name: Verify the receipt
+        run: verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject widget.tar.gz
+
+      - name: Refuse the archive with one bit changed
+        run: |
+          python3 -c "b=bytearray(open('widget.tar.gz','rb').read()); b[len(b)//2]^=1; open('changed.tar.gz','wb').write(b)"
+          if verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject changed.tar.gz; then
+            echo "a changed archive was accepted" >&2
+            exit 1
+          fi
