@@ -1,0 +1,175 @@
+name: Install the latest release and check what it made
+
+# Nothing in this file names a release. The first job asks GitHub which release of TimeWitness is
+# the latest and reads the line the README at that release tells a stranger to write, so a new
+# release reaches this repository on the next run with no edit here. The second job installs that
+# line and stamps a build with it. The third downloads what the second published and checks it with
+# no token, the way somebody who trusts neither of us would.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: install-check
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  latest:
+    name: Find the latest release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      line: ${{ steps.find.outputs.line }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=Fountech-ai-Limited/timewitness
+          tag=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+          [ -n "$tag" ] || { echo "::error::No latest release of $repo"; exit 1; }
+
+          # The line, word for word, off the README at that release. Exactly one is allowed, because
+          # two would mean the README tells a stranger two different things.
+          lines=$(curl -sSfL "https://raw.githubusercontent.com/$repo/$tag/README.md" \
+            | grep -E '^[[:space:]]*- uses: Fountech-ai-Limited/timewitness@[^[:space:]]+[[:space:]]*$' \
+            | sed -E 's/^[[:space:]]*- uses: //; s/[[:space:]]+$//' | sort -u || true)
+          if [ "$(printf '%s\n' "$lines" | grep -c . || true)" != 1 ]; then
+            echo "::error::The README at $tag does not give exactly one install line: [$lines]"
+            exit 1
+          fi
+          line=$lines
+          ref=${line##*@}
+
+          # The line has to install the release it ships in. A README at a new release still naming
+          # the one before would pass everything below and prove nothing about the new one.
+          refs=$(git ls-remote "https://github.com/$repo.git")
+          commit_of() {
+            printf '%s\n' "$refs" | awk -v r="$1" '
+              $2 == "refs/tags/" r "^{}" { p = $1 }
+              $2 == "refs/tags/" r { t = $1 }
+              $2 == "refs/heads/" r { h = $1 }
+              END { print (p != "" ? p : (t != "" ? t : h)) }'
+          }
+          want=$(commit_of "$tag")
+          got=$(commit_of "$ref")
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "::error::The README at $tag says to install @$ref, which is [$got], and $tag is [$want]"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "line=$line" >> "$GITHUB_OUTPUT"
+          {
+            echo "Latest release: \`$tag\`, commit \`$want\`."
+            echo
+            echo "The line its README gives a stranger: \`- uses: $line\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  install:
+    name: Install ${{ needs.latest.outputs.tag }} in one line and stamp a build
+    needs: latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the thing
+        run: |
+          mkdir -p dist
+          tar -czf dist/widget.tar.gz README.md
+
+      # A `uses:` cannot be worked out while a workflow runs, so the line goes into a local action
+      # that holds nothing else, and GitHub fetches what it names the way it would in anybody's
+      # workflow. It is the README's example as written, down to the path of the archive.
+      - name: Write the one line
+        env:
+          LINE: ${{ needs.latest.outputs.line }}
+        run: |
+          mkdir -p .install
+          cat > .install/action.yml <<END
+          name: The one line
+          description: Installs TimeWitness the way its README says to.
+          runs:
+            using: composite
+            steps:
+              - uses: $LINE
+                with:
+                  subject: dist/widget.tar.gz
+          END
+          cat .install/action.yml
+
+      - uses: ./.install
+
+      - name: Release the archive and its receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.latest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release="stamped-with-$TAG"
+          mv timewitness-receipt.cbor dist/widget.tar.gz.receipt
+          if gh release view "$release" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Stamped with TimeWitness $TAG" \
+              --notes "An archive and its receipt, made by TimeWitness $TAG. Every run replaces both, so this is always the latest pair."
+          fi
+          echo "Released as \`$release\` from run $GITHUB_RUN_ID." >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Check what ${{ needs.latest.outputs.tag }} made, as a stranger
+    needs: [latest, install]
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      TAG: ${{ needs.latest.outputs.tag }}
+    steps:
+      - name: Download the archive and its receipt, with no token
+        run: |
+          set -euo pipefail
+          for f in widget.tar.gz widget.tar.gz.receipt; do
+            curl -sSfL -o "$f" "https://github.com/$GITHUB_REPOSITORY/releases/download/stamped-with-$TAG/$f"
+          done
+          ls -l widget.tar.gz widget.tar.gz.receipt
+
+      - name: Build the verifier from the public source at the same release, with no token
+        run: |
+          git clone --depth 1 --branch "$TAG" https://github.com/Fountech-ai-Limited/timewitness.git verifier-src
+          git -C verifier-src rev-parse HEAD
+          cargo build --release --manifest-path verifier-src/Cargo.toml --bin timewitness
+
+      - name: Verify the receipt
+        run: verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject widget.tar.gz
+
+      - name: Refuse the archive with one bit changed
+        run: |
+          python3 -c "b=bytearray(open('widget.tar.gz','rb').read()); b[len(b)//2]^=1; open('changed.tar.gz','wb').write(b)"
+          if verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject changed.tar.gz; then
+            echo "::error::A changed archive was accepted"
+            exit 1
+          fi
+
+  # GitHub stops a schedule in a public repository after sixty days with nothing pushed to it. This
+  # turns it back on from inside every scheduled run. If that ever stops being enough, the runs stop
+  # getting younger, and the check on the other side reads their age.
+  schedule:
+    name: Keep the schedule on
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/install-check.yml/enable"
