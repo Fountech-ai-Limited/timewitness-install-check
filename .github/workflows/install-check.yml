@@ -3,8 +3,10 @@ name: Install the latest release and check what it made
 # Nothing in this file names a release. The first job asks GitHub which release of TimeWitness is
 # the latest and reads the line the README at that release tells a stranger to write, so a new
 # release reaches this repository on the next run with no edit here. The second job installs that
-# line and stamps a build with it. The third downloads what the second published and checks it with
-# no token, the way somebody who trusts neither of us would.
+# line and stamps a build with it, once as the README writes it and once more naming a provenance
+# statement for the receipt to ride in. The third downloads what the second published and checks it
+# with no token, the way somebody who trusts neither of us would: the receipt beside the archive,
+# and the receipt the provenance carries, each refused with one bit changed.
 on:
   push:
     branches: [main]
@@ -88,6 +90,24 @@ jobs:
           mkdir -p dist
           tar -czf dist/widget.tar.gz README.md
 
+      # The smallest in-toto statement that names the archive, standing in for the SLSA provenance a
+      # real build already ships. The Action writes its receipt into the predicate of whatever it is
+      # handed, so this is what it is handed.
+      - name: Write a provenance statement for it
+        shell: python3 {0}
+        run: |
+          import hashlib, json
+          digest = hashlib.sha256(open("dist/widget.tar.gz", "rb").read()).hexdigest()
+          statement = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{"name": "widget.tar.gz", "digest": {"sha256": digest}}],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {},
+          }
+          with open("dist/widget.intoto.json", "w", encoding="utf-8") as handle:
+              json.dump(statement, handle, indent=2)
+              handle.write("\n")
+
       # A `uses:` cannot be worked out while a workflow runs, so the line goes into a local action
       # that holds nothing else, and GitHub fetches what it names the way it would in anybody's
       # workflow. It is the README's example as written, down to the path of the archive.
@@ -110,6 +130,30 @@ jobs:
 
       - uses: ./.install
 
+      # The same line again with the statement named, which is how the README says the receipt goes
+      # into provenance that already ships. An action of its own, so the first stays the README's
+      # example word for word.
+      - name: Write the line again, naming the provenance
+        env:
+          LINE: ${{ needs.latest.outputs.line }}
+        run: |
+          mkdir -p .provenance
+          cat > .provenance/action.yml <<END
+          name: The one line, with provenance
+          description: Installs TimeWitness the way its README says to and writes the receipt into a statement.
+          runs:
+            using: composite
+            steps:
+              - uses: $LINE
+                with:
+                  subject: dist/widget.tar.gz
+                  provenance: dist/widget.intoto.json
+                  output: provenance-receipt.cbor
+          END
+          cat .provenance/action.yml
+
+      - uses: ./.provenance
+
       - name: Release the archive and its receipt
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,11 +163,11 @@ jobs:
           release="stamped-with-$TAG"
           mv timewitness-receipt.cbor dist/widget.tar.gz.receipt
           if gh release view "$release" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt --clobber -R "$GITHUB_REPOSITORY"
+            gh release upload "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt dist/widget.intoto.json --clobber -R "$GITHUB_REPOSITORY"
           else
-            gh release create "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt -R "$GITHUB_REPOSITORY" \
+            gh release create "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt dist/widget.intoto.json -R "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" --title "Stamped with TimeWitness $TAG" \
-              --notes "An archive and its receipt, made by TimeWitness $TAG. Every run replaces both, so this is always the latest pair."
+              --notes "An archive, its receipt, and a provenance statement carrying a second receipt, made by TimeWitness $TAG. Every run replaces all three, so this is always the latest set."
           fi
           echo "Released as \`$release\` from run $GITHUB_RUN_ID." >> "$GITHUB_STEP_SUMMARY"
 
@@ -135,13 +179,13 @@ jobs:
     env:
       TAG: ${{ needs.latest.outputs.tag }}
     steps:
-      - name: Download the archive and its receipt, with no token
+      - name: Download the archive, its receipt and its provenance, with no token
         run: |
           set -euo pipefail
-          for f in widget.tar.gz widget.tar.gz.receipt; do
+          for f in widget.tar.gz widget.tar.gz.receipt widget.intoto.json; do
             curl -sSfL -o "$f" "https://github.com/$GITHUB_REPOSITORY/releases/download/stamped-with-$TAG/$f"
           done
-          ls -l widget.tar.gz widget.tar.gz.receipt
+          ls -l widget.tar.gz widget.tar.gz.receipt widget.intoto.json
 
       - name: Build the verifier from the public source at the same release, with no token
         run: |
@@ -157,6 +201,45 @@ jobs:
           python3 -c "b=bytearray(open('widget.tar.gz','rb').read()); b[len(b)//2]^=1; open('changed.tar.gz','wb').write(b)"
           if verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject changed.tar.gz; then
             echo "::error::A changed archive was accepted"
+            exit 1
+          fi
+
+      # A consumer reading provenance finds the receipt as base64 in the predicate and nothing else.
+      # So it is taken out of there, not from the file beside the archive, and checked on its own.
+      - name: Take the receipt out of the provenance
+        shell: python3 {0}
+        run: |
+          import base64, json
+          carried = json.load(open("widget.intoto.json", encoding="utf-8"))["predicate"]["boundedTime"]
+          with open("provenance-receipt.cbor", "wb") as handle:
+              handle.write(base64.b64decode(carried["receiptBase64"], validate=True))
+          with open("provenance-format.txt", "w", encoding="utf-8") as handle:
+              handle.write(carried["format"])
+          print("the provenance says the receipt is in format", carried["format"])
+
+      - name: Verify the receipt the provenance carries
+        run: verifier-src/target/release/timewitness verify provenance-receipt.cbor --subject widget.tar.gz
+
+      - name: Refuse that receipt with one bit changed
+        run: |
+          python3 -c "b=bytearray(open('provenance-receipt.cbor','rb').read()); b[len(b)//2]^=1; open('changed-receipt.cbor','wb').write(b)"
+          if verifier-src/target/release/timewitness verify changed-receipt.cbor --subject widget.tar.gz; then
+            echo "::error::A receipt with one bit changed was accepted"
+            exit 1
+          fi
+
+      # The label a consumer would pick a reader by, against the version the receipt's own bytes
+      # carry, as the verifier built from the same release reads them.
+      - name: The provenance names the receipt's own format
+        run: |
+          set -euo pipefail
+          fields=$(verifier-src/target/release/timewitness verify provenance-receipt.cbor --subject widget.tar.gz --fields)
+          version=$(printf '%s\n' "$fields" | sed -n 's/^format_version=//p')
+          said=$(cat provenance-format.txt)
+          echo "the receipt is format version [$version] and the provenance says [$said]"
+          case "$version" in ''|*[!0-9]*) echo "::error::The verifier read no format version off the receipt"; exit 1;; esac
+          if [ "$said" != "timewitness-receipt-v$version" ]; then
+            echo "::error::The provenance calls a format $version receipt $said"
             exit 1
           fi
 
