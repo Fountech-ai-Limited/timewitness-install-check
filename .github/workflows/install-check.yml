@@ -1,0 +1,265 @@
+name: Install the latest release and check what it made
+
+# Nothing in this file names a release. The first job asks GitHub which release of TimeWitness is
+# the latest and reads the line the README at that release tells a stranger to write, so a new
+# release reaches this repository on the next run with no edit here. The second job installs that
+# line and stamps a build with it, once as the README writes it and once more naming a provenance
+# statement for the receipt to ride in. The third downloads what the second published and checks it
+# with no token, the way somebody who trusts neither of us would: the receipt beside the archive,
+# and the receipt the provenance carries, each refused with one bit changed.
+#
+# A pull request runs the first job only. It reads and writes nothing of ours, and it is the check
+# `main` requires before anything lands there, so a change to this file is seen to find the line
+# before it can publish anything. The jobs that publish run on `main` and nowhere else.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: install-check
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  latest:
+    name: Find the latest release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      line: ${{ steps.find.outputs.line }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=Fountech-ai-Limited/timewitness
+          tag=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+          [ -n "$tag" ] || { echo "::error::No latest release of $repo"; exit 1; }
+
+          # The line, word for word, off the README at that release. Exactly one is allowed, because
+          # two would mean the README tells a stranger two different things.
+          lines=$(curl -sSfL "https://raw.githubusercontent.com/$repo/$tag/README.md" \
+            | grep -E '^[[:space:]]*- uses: Fountech-ai-Limited/timewitness@[^[:space:]]+[[:space:]]*$' \
+            | sed -E 's/^[[:space:]]*- uses: //; s/[[:space:]]+$//' | sort -u || true)
+          if [ "$(printf '%s\n' "$lines" | grep -c . || true)" != 1 ]; then
+            echo "::error::The README at $tag does not give exactly one install line: [$lines]"
+            exit 1
+          fi
+          line=$lines
+          ref=${line##*@}
+
+          # The line has to install the release it ships in. A README at a new release still naming
+          # the one before would pass everything below and prove nothing about the new one.
+          refs=$(git ls-remote "https://github.com/$repo.git")
+          commit_of() {
+            printf '%s\n' "$refs" | awk -v r="$1" '
+              $2 == "refs/tags/" r "^{}" { p = $1 }
+              $2 == "refs/tags/" r { t = $1 }
+              $2 == "refs/heads/" r { h = $1 }
+              END { print (p != "" ? p : (t != "" ? t : h)) }'
+          }
+          want=$(commit_of "$tag")
+          got=$(commit_of "$ref")
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "::error::The README at $tag says to install @$ref, which is [$got], and $tag is [$want]"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "line=$line" >> "$GITHUB_OUTPUT"
+          {
+            echo "Latest release: \`$tag\`, commit \`$want\`."
+            echo
+            echo "The line its README gives a stranger: \`- uses: $line\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  install:
+    name: Install ${{ needs.latest.outputs.tag }} in one line and stamp a build
+    needs: latest
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build the thing
+        run: |
+          mkdir -p dist
+          tar -czf dist/widget.tar.gz README.md
+
+      # The smallest in-toto statement that names the archive, standing in for the SLSA provenance a
+      # real build already ships. The Action writes its receipt into the predicate of whatever it is
+      # handed, so this is what it is handed.
+      - name: Write a provenance statement for it
+        shell: python3 {0}
+        run: |
+          import hashlib, json
+          digest = hashlib.sha256(open("dist/widget.tar.gz", "rb").read()).hexdigest()
+          statement = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{"name": "widget.tar.gz", "digest": {"sha256": digest}}],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {},
+          }
+          with open("dist/widget.intoto.json", "w", encoding="utf-8") as handle:
+              json.dump(statement, handle, indent=2)
+              handle.write("\n")
+
+      # A `uses:` cannot be worked out while a workflow runs, so the line goes into a local action
+      # that holds nothing else, and GitHub fetches what it names the way it would in anybody's
+      # workflow. It is the README's example as written, down to the path of the archive.
+      - name: Write the one line
+        env:
+          LINE: ${{ needs.latest.outputs.line }}
+        run: |
+          mkdir -p .install
+          cat > .install/action.yml <<END
+          name: The one line
+          description: Installs TimeWitness the way its README says to.
+          runs:
+            using: composite
+            steps:
+              - uses: $LINE
+                with:
+                  subject: dist/widget.tar.gz
+          END
+          cat .install/action.yml
+
+      - uses: ./.install
+
+      # The same line again with the statement named, which is how the README says the receipt goes
+      # into provenance that already ships. An action of its own, so the first stays the README's
+      # example word for word.
+      - name: Write the line again, naming the provenance
+        env:
+          LINE: ${{ needs.latest.outputs.line }}
+        run: |
+          mkdir -p .provenance
+          cat > .provenance/action.yml <<END
+          name: The one line, with provenance
+          description: Installs TimeWitness the way its README says to and writes the receipt into a statement.
+          runs:
+            using: composite
+            steps:
+              - uses: $LINE
+                with:
+                  subject: dist/widget.tar.gz
+                  provenance: dist/widget.intoto.json
+                  output: provenance-receipt.cbor
+          END
+          cat .provenance/action.yml
+
+      - uses: ./.provenance
+
+      - name: Release the archive and its receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.latest.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release="stamped-with-$TAG"
+          mv timewitness-receipt.cbor dist/widget.tar.gz.receipt
+          if gh release view "$release" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt dist/widget.intoto.json --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$release" dist/widget.tar.gz dist/widget.tar.gz.receipt dist/widget.intoto.json -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "Stamped with TimeWitness $TAG" \
+              --notes "An archive, its receipt, and a provenance statement carrying a second receipt, made by TimeWitness $TAG. Every run replaces all three, so this is always the latest set."
+          fi
+          echo "Released as \`$release\` from run $GITHUB_RUN_ID." >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Check what ${{ needs.latest.outputs.tag }} made, as a stranger
+    needs: [latest, install]
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      TAG: ${{ needs.latest.outputs.tag }}
+    steps:
+      - name: Download the archive, its receipt and its provenance, with no token
+        run: |
+          set -euo pipefail
+          for f in widget.tar.gz widget.tar.gz.receipt widget.intoto.json; do
+            curl -sSfL -o "$f" "https://github.com/$GITHUB_REPOSITORY/releases/download/stamped-with-$TAG/$f"
+          done
+          ls -l widget.tar.gz widget.tar.gz.receipt widget.intoto.json
+
+      - name: Build the verifier from the public source at the same release, with no token
+        run: |
+          git clone --depth 1 --branch "$TAG" https://github.com/Fountech-ai-Limited/timewitness.git verifier-src
+          git -C verifier-src rev-parse HEAD
+          cargo build --release --manifest-path verifier-src/Cargo.toml --bin timewitness
+
+      - name: Verify the receipt
+        run: verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject widget.tar.gz
+
+      - name: Refuse the archive with one bit changed
+        run: |
+          python3 -c "b=bytearray(open('widget.tar.gz','rb').read()); b[len(b)//2]^=1; open('changed.tar.gz','wb').write(b)"
+          if verifier-src/target/release/timewitness verify widget.tar.gz.receipt --subject changed.tar.gz; then
+            echo "::error::A changed archive was accepted"
+            exit 1
+          fi
+
+      # A consumer reading provenance finds the receipt as base64 in the predicate and nothing else.
+      # So it is taken out of there, not from the file beside the archive, and checked on its own.
+      - name: Take the receipt out of the provenance
+        shell: python3 {0}
+        run: |
+          import base64, json
+          carried = json.load(open("widget.intoto.json", encoding="utf-8"))["predicate"]["boundedTime"]
+          with open("provenance-receipt.cbor", "wb") as handle:
+              handle.write(base64.b64decode(carried["receiptBase64"], validate=True))
+          with open("provenance-format.txt", "w", encoding="utf-8") as handle:
+              handle.write(carried["format"])
+          print("the provenance says the receipt is in format", carried["format"])
+
+      - name: Verify the receipt the provenance carries
+        run: verifier-src/target/release/timewitness verify provenance-receipt.cbor --subject widget.tar.gz
+
+      - name: Refuse that receipt with one bit changed
+        run: |
+          python3 -c "b=bytearray(open('provenance-receipt.cbor','rb').read()); b[len(b)//2]^=1; open('changed-receipt.cbor','wb').write(b)"
+          if verifier-src/target/release/timewitness verify changed-receipt.cbor --subject widget.tar.gz; then
+            echo "::error::A receipt with one bit changed was accepted"
+            exit 1
+          fi
+
+      # The label a consumer would pick a reader by, against the version the receipt's own bytes
+      # carry, as the verifier built from the same release reads them.
+      - name: The provenance names the receipt's own format
+        run: |
+          set -euo pipefail
+          fields=$(verifier-src/target/release/timewitness verify provenance-receipt.cbor --subject widget.tar.gz --fields)
+          version=$(printf '%s\n' "$fields" | sed -n 's/^format_version=//p')
+          said=$(cat provenance-format.txt)
+          echo "the receipt is format version [$version] and the provenance says [$said]"
+          case "$version" in ''|*[!0-9]*) echo "::error::The verifier read no format version off the receipt"; exit 1;; esac
+          if [ "$said" != "timewitness-receipt-v$version" ]; then
+            echo "::error::The provenance calls a format $version receipt $said"
+            exit 1
+          fi
+
+  # GitHub stops a schedule in a public repository after sixty days with nothing pushed to it. This
+  # turns it back on from inside every scheduled run. If that ever stops being enough, the runs stop
+  # getting younger, and the check on the other side reads their age.
+  schedule:
+    name: Keep the schedule on
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/install-check.yml/enable"
